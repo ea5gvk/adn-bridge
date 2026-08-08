@@ -139,28 +139,46 @@ static void engine_stop(engine_ctx_t *ctx)
     ctx->core->bus = NULL;
 }
 
+/* Datagrams a single poll may consume before yielding to the other peers.
+ * DMR delivers a voice burst every 60 ms and YSF every 90 ms, so reading one
+ * per engine iteration silently accumulates delay whenever the loop runs
+ * slower than that — the kernel queue grows and never drains back. EchoLink
+ * has drained its own queue since it hit the same problem. The cap keeps a
+ * long stall from dumping seconds of audio downstream in one go. */
+#define ENGINE_RX_DRAIN_MAX 8
+
 static void engine_poll_dmr_slot(engine_ctx_t *ctx, media_peer_slot_t *slot)
 {
-    int from_dmr = 0, len;
     peer_dmr_t *dmr = &slot->u.dmr;
+    int i;
 
     peer_dmr_tick(dmr);
-    len = peer_dmr_poll(dmr, 5, &from_dmr);
-    if (!from_dmr || len <= 0)
-        return;
-    adapter_dmr_on_wire(ctx->core, slot->router_id, dmr, dmr->buf, len);
+    for (i = 0; i < ENGINE_RX_DRAIN_MAX; i++) {
+        int from_dmr = 0;
+        int len = peer_dmr_poll(dmr, i == 0 ? 5 : 0, &from_dmr);
+
+        if (len <= 0)
+            return;
+        if (from_dmr)
+            adapter_dmr_on_wire(ctx->core, slot->router_id, dmr, dmr->buf, len);
+    }
 }
 
 static void engine_poll_ysf_slot(engine_ctx_t *ctx, media_peer_slot_t *slot)
 {
-    int from_ysf = 0, len;
     peer_ysf_t *ysf = &slot->u.ysf;
+    int i;
 
     peer_ysf_tick(ysf);
-    len = peer_ysf_poll(ysf, 5, &from_ysf);
-    if (!from_ysf || len != 155)
-        return;
-    adapter_ysf_on_wire(ctx->core, slot->router_id, ysf, ysf->buf, len);
+    for (i = 0; i < ENGINE_RX_DRAIN_MAX; i++) {
+        int from_ysf = 0;
+        int len = peer_ysf_poll(ysf, i == 0 ? 5 : 0, &from_ysf);
+
+        if (len <= 0)
+            return;
+        if (from_ysf && len == 155)
+            adapter_ysf_on_wire(ctx->core, slot->router_id, ysf, ysf->buf, len);
+    }
 }
 
 static void engine_poll_el_slot(media_peer_slot_t *slot)
@@ -196,9 +214,36 @@ static void engine_poll_bus(engine_ctx_t *ctx)
     }
 }
 
+/* Loop rate is the hidden variable behind both "audio arrives late" and
+ * "audio is choppy": DMR needs this above ~17 Hz to stay real time, since a
+ * voice burst lands every 60 ms. Reported every 10 s so a capture answers the
+ * question instead of leaving it to inference. */
+static void engine_log_loop_rate(void)
+{
+    static struct timespec since;
+    static unsigned ticks;
+    struct timespec now;
+    long ms;
+
+    ticks++;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (since.tv_sec == 0) {
+        since = now;
+        return;
+    }
+    ms = (now.tv_sec - since.tv_sec) * 1000L + (now.tv_nsec - since.tv_nsec) / 1000000L;
+    if (ms < 10000)
+        return;
+    LOG_DEBUG("engine: loop %.1f Hz (%u ticks / %ld ms)\n",
+              (double)ticks * 1000.0 / (double)ms, ticks, ms);
+    ticks = 0;
+    since = now;
+}
+
 static void engine_step(engine_host_t *host, adn_bridge_config_t *cfg,
                         engine_ctx_t *ctx, time_t *last_alias_poll)
 {
+    engine_log_loop_rate();
     engine_poll_bus(ctx);
     engine_poll_aliases(cfg, host, last_alias_poll, &ctx->core->aliases);
     media_core_poll_el_pcm(ctx->core);
