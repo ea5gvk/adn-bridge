@@ -23,6 +23,10 @@
 #include <string.h>
 
 #define DMR_FRAME_MS   60 /* bridge_el paces DMR TX slightly slower than adapters/dmr.c's 55ms */
+/* Most frames a single tick may emit to catch up after the engine loop ran
+ * late. Enough to absorb ordinary jitter (~300 ms) without turning a long
+ * stall into a burst the master would see as a flood. */
+#define EL_DMR_CATCHUP_MAX 5
 #define YSF_FRAME_MS   90
 #define CONNECT_PTT_MS 500               /* on-air duration of each connect-PTT burst (4000 and real TG alike) */
 #define CONNECT_PTT_START_DELAY_MS 2000  /* silent gap after DMR connects, before the first connect-PTT starts */
@@ -733,15 +737,41 @@ static int core_el_any_connect_ptt_active(const media_core_t *core)
 static void core_el_dmr_pace_tx(media_core_t *core)
 {
     uint8_t voice33[33];
+    int budget = 1;
 
     if (core->leg_el_rx.phase == MEDIA_CALL_RX_FROM_PEER || core_el_any_connect_ptt_active(core)
         || core->leg_el_tx_dmr.dmr_ending)
         return;
-    if (core->leg_el_tx_dmr.phase == MEDIA_CALL_TX_TO_PEER
-        && !bridge_ms_elapsed(&core->leg_el_tx_dmr.last_dmr_tx, DMR_FRAME_MS))
-        return;
-    if (modeconv_get_dmr(core->mc_el_dmr, voice33) == MODECONV_TAG_DATA)
+    if (core->leg_el_tx_dmr.phase == MEDIA_CALL_TX_TO_PEER) {
+        /* One frame per tick only kept up while the engine looped faster than
+         * DMR_FRAME_MS. When it does not, EchoLink keeps feeding AMBE in at
+         * real time while the drain runs at the tick rate, and the backlog
+         * grows until ModeConv's ring overflows and dumps the whole call.
+         * Emit what the wall clock says we owe, capped so a long stall
+         * cannot dump a burst onto the master. */
+        long late = bridge_ms_since(&core->leg_el_tx_dmr.last_dmr_tx);
+
+        if (late < DMR_FRAME_MS)
+            return;
+        budget = (int)(late / DMR_FRAME_MS);
+        if (budget > EL_DMR_CATCHUP_MAX)
+            budget = EL_DMR_CATCHUP_MAX;
+    }
+    while (budget-- > 0) {
+        if (modeconv_get_dmr(core->mc_el_dmr, voice33) != MODECONV_TAG_DATA) {
+            /* Distinguishes "nothing queued to send" from "pacer not run
+             * often enough" when reading a capture of a choppy call. */
+            if (core->leg_el_tx_dmr.phase == MEDIA_CALL_TX_TO_PEER) {
+                static int starved;
+
+                if (bridge_dbg_periodic(&starved))
+                    LOG_DMR_DEBUG("%s pacer starved — no AMBE queued\n",
+                                  media_flow_label(MEDIA_PEER_ECHOLINK, MEDIA_PEER_DMR));
+            }
+            return;
+        }
         core_el_dmr_emit_voice(core, voice33);
+    }
 }
 
 /* =====================================================================

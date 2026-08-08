@@ -677,11 +677,19 @@ void CModeConv::putAMBE2DMR(unsigned int dat_a, unsigned int dat_b, unsigned int
 		WRITE_BIT(v_dmr, cPos, dat_c & MASK);
 	}
 
-	m_DMR.addData(&TAG_DATA, 1U);
-	m_DMR.addData(v_dmr, 9U);
+	/* CRingBuffer::addData() empties the whole ring on overflow. Bumping
+	 * m_dmrN regardless (as upstream does) leaves the counter claiming frames
+	 * the ring no longer holds, and getDMR() then hands the caller stale or
+	 * uninitialised memory as voice. Resynchronise instead: the backlog is
+	 * already lost, so drop the counter with it. */
+	if (!m_DMR.addData(&TAG_DATA, 1U) || !m_DMR.addData(v_dmr, 9U)) {
+		m_DMR.clear();
+		m_dmrN = 0U;
+		return;
+	}
 
 	//CUtils::dump(1U, "DMR Voice:", v_dmr, 9U);
-	
+
 	m_dmrN += 1U;
 }
 
@@ -864,33 +872,48 @@ unsigned int CModeConv::getDMR(unsigned char* data)
 
 	tag[0U] = TAG_NODATA;
 
+	/* Every read below is checked: upstream ignored the return values and
+	 * returned TAG_DATA unconditionally, so a ring that had fewer frames than
+	 * m_dmrN claimed left *data untouched and the caller transmitted its own
+	 * uninitialised stack buffer as voice. On any short read the counter and
+	 * the ring have diverged, so reset both and report nothing to send. */
 	if (m_dmrN >= 1U) {
-		m_DMR.peek(tag, 1U);
+		if (!m_DMR.peek(tag, 1U)) {
+			m_DMR.clear();
+			m_dmrN = 0U;
+			return TAG_NODATA;
+		}
 
 		if (tag[0U] != TAG_DATA) {
-			m_DMR.getData(tag, 1U);
-			m_DMR.getData(data, 9U);
+			if (!m_DMR.getData(tag, 1U) || !m_DMR.getData(data, 9U)) {
+				m_DMR.clear();
+				m_dmrN = 0U;
+				return TAG_NODATA;
+			}
 			m_dmrN -= 1U;
 			return tag[0U];
 		}
 	}
 
 	if (m_dmrN >= 3U) {
-		m_DMR.getData(tag, 1U);
-		m_DMR.getData(data, 9U);
-		m_dmrN -= 1U;
-
-		m_DMR.getData(tag, 1U);
-		m_DMR.getData(tmp, 9U);
-		m_dmrN -= 1U;
+		if (!m_DMR.getData(tag, 1U) || !m_DMR.getData(data, 9U)
+		    || !m_DMR.getData(tag, 1U) || !m_DMR.getData(tmp, 9U)) {
+			m_DMR.clear();
+			m_dmrN = 0U;
+			return TAG_NODATA;
+		}
+		m_dmrN -= 2U;
 
 		::memcpy(data + 9U, tmp, 4U);
 		data[13U] = tmp[4U] & 0xF0U;
 		data[19U] = tmp[4U] & 0x0FU;
 		::memcpy(data + 20U, tmp + 5U, 4U);
 
-		m_DMR.getData(tag, 1U);
-		m_DMR.getData(data + 24U, 9U);
+		if (!m_DMR.getData(tag, 1U) || !m_DMR.getData(data + 24U, 9U)) {
+			m_DMR.clear();
+			m_dmrN = 0U;
+			return TAG_NODATA;
+		}
 		m_dmrN -= 1U;
 
 		return TAG_DATA;
