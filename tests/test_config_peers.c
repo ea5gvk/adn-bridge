@@ -106,6 +106,7 @@ static int test_el_dmr_with_vocoder(void)
         "bind_addr = 127.0.0.1\n"
         "vocoder_host = 127.0.0.1\n"
         "vocoder_port = 2460\n"
+        "vocoder_wire = raw\n"
         "[peer.master]\n"
         "type = dmr\n"
         "enabled = true\n"
@@ -129,8 +130,74 @@ static int test_el_dmr_with_vocoder(void)
     if (!el || strcmp(el->u.el.vocoder_host, "127.0.0.1") != 0
         || el->u.el.vocoder_port != 2460)
         return 43;
+    if (el->u.el.vocoder_wire != 1) /* VOC_WIRE_RAW */
+        return 45;
     if (!adn_bridge_config_find_peer(&cfg, ADN_BRIDGE_PEER_TYPE_DMR))
         return 44;
+    return 0;
+}
+
+/* vocoder_wire defaults to auto (probe at open) when the key is absent. */
+static int test_vocoder_wire_defaults_auto(void)
+{
+    const char *ini =
+        "[peer.el]\n"
+        "type = echolink\n"
+        "enabled = true\n"
+        "callsign = N0CALL-L\n"
+        "password = secret\n"
+        "bind_addr = 127.0.0.1\n"
+        "vocoder_host = 127.0.0.1\n"
+        "[peer.master]\n"
+        "type = dmr\n"
+        "enabled = true\n"
+        "callsign = N0CALL\n"
+        "dmrid = 1234567\n"
+        "host = m.example\n"
+        "port = 62031\n"
+        "tg = 9\n"
+        "password = secret\n";
+    adn_bridge_config_t cfg;
+    char err[128];
+    const adn_bridge_peer_t *el;
+
+    if (write_ini("/tmp/adn-test-voc-wire-auto.ini", ini) != 0)
+        return 130;
+    if (adn_bridge_config_load("/tmp/adn-test-voc-wire-auto.ini", &cfg, err, sizeof(err)) != 0)
+        return 131;
+    el = adn_bridge_config_find_peer(&cfg, ADN_BRIDGE_PEER_TYPE_ECHOLINK);
+    if (!el || el->u.el.vocoder_wire != 0) /* VOC_WIRE_AUTO */
+        return 132;
+    return 0;
+}
+
+static int test_reject_bad_vocoder_wire(void)
+{
+    const char *ini =
+        "[peer.el]\n"
+        "type = echolink\n"
+        "enabled = true\n"
+        "callsign = N0CALL-L\n"
+        "password = secret\n"
+        "bind_addr = 127.0.0.1\n"
+        "vocoder_host = 127.0.0.1\n"
+        "vocoder_wire = deinterleaved\n"
+        "[peer.master]\n"
+        "type = dmr\n"
+        "enabled = true\n"
+        "callsign = N0CALL\n"
+        "dmrid = 1\n"
+        "host = m.example\n"
+        "port = 62031\n"
+        "tg = 1\n"
+        "password = x\n";
+    adn_bridge_config_t cfg;
+    char err[256];
+
+    if (write_ini("/tmp/adn-test-voc-wire-bad.ini", ini) != 0)
+        return 140;
+    if (adn_bridge_config_load("/tmp/adn-test-voc-wire-bad.ini", &cfg, err, sizeof(err)) == 0)
+        return 141;
     return 0;
 }
 
@@ -387,6 +454,16 @@ int main(void)
     if (rc != 0) {
         fprintf(stderr, "test_config_peers: el+dmr valid failed (%d)\n", rc);
         return 3;
+    }
+    rc = test_vocoder_wire_defaults_auto();
+    if (rc != 0) {
+        fprintf(stderr, "test_config_peers: vocoder_wire default failed (%d)\n", rc);
+        return 11;
+    }
+    rc = test_reject_bad_vocoder_wire();
+    if (rc != 0) {
+        fprintf(stderr, "test_config_peers: bad vocoder_wire reject failed (%d)\n", rc);
+        return 12;
     }
     rc = test_reject_single_peer();
     if (rc != 0) {

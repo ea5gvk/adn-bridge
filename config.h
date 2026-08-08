@@ -84,6 +84,7 @@ typedef struct {
     char proxy_password[64];
     char vocoder_host[128];
     int vocoder_port;
+    int vocoder_wire;      /* voc_wire_t: 0 = auto (probe), 1 = raw, 2 = interleaved */
     int vocoder_log_level; /* -1 = inherit [log] level= */
     int log_level;
 } adn_bridge_peer_el_t;

@@ -300,8 +300,24 @@ static adn_bridge_peer_t *find_or_add_peer(adn_bridge_config_t *cfg, const char 
 static int is_vocoder_peer_key(const char *key)
 {
     return strcmp(key, "vocoder_host") == 0 || strcmp(key, "vocoder_port") == 0
+           || strcmp(key, "vocoder_wire") == 0
            || strcmp(key, "vocoder_log_level") == 0 || strcmp(key, "vocoder_log") == 0
            || strcmp(key, "vocoder") == 0;
+}
+
+/* Mirrors voc_wire_t in vocoder.h (kept as an int here so config.c does not
+ * have to pull the vocoder in). */
+static int parse_vocoder_wire(const char *val)
+{
+    if (!val || !*val)
+        return -1;
+    if (strcmp(val, "auto") == 0)
+        return 0;
+    if (strcmp(val, "raw") == 0)
+        return 1;
+    if (strcmp(val, "interleaved") == 0 || strcmp(val, "interleave49") == 0)
+        return 2;
+    return -1;
 }
 
 static void apply_peer_dmr_key(adn_bridge_peer_dmr_t *d, const char *key, const char *val)
@@ -389,6 +405,8 @@ static void apply_peer_el_key(adn_bridge_peer_el_t *el, const char *key, const c
         set_str(el->vocoder_host, sizeof(el->vocoder_host), val);
     else if (strcmp(key, "vocoder_port") == 0)
         set_int(&el->vocoder_port, val);
+    else if (strcmp(key, "vocoder_wire") == 0)
+        el->vocoder_wire = parse_vocoder_wire(val);
     else if (strcmp(key, "vocoder_log_level") == 0 || strcmp(key, "vocoder_log") == 0)
         el->vocoder_log_level = (int)log_level_from_string(val);
     else if (strcmp(key, "log_level") == 0 || strcmp(key, "log") == 0)
@@ -431,6 +449,12 @@ static int apply_peer_key(adn_bridge_config_t *cfg, const char *peer_name,
         if (strcmp(key, "vocoder") == 0) {
             snprintf(err, errlen,
                      "%s:%d: [peer.%s] use vocoder_host/vocoder_port (not vocoder=)",
+                     path, lineno, peer_name);
+            return -1;
+        }
+        if (strcmp(key, "vocoder_wire") == 0 && parse_vocoder_wire(val) < 0) {
+            snprintf(err, errlen,
+                     "%s:%d: [peer.%s] vocoder_wire must be auto, raw or interleaved",
                      path, lineno, peer_name);
             return -1;
         }

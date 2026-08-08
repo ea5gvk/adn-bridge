@@ -134,6 +134,24 @@ vocoder_port = 2460
 
 Without a reachable vocoder there is no voice between EchoLink and DMR/YSF.
 
+#### Wire bit order (`vocoder_wire`)
+
+ModeConv hands over AMBE frames in the standard 49-bit field order
+(a12/b12/c25). A **DVSI AMBE3000 / DV3000** wants exactly that; **md380-emu**
+instead expects the DMR on-air interleaving and undoes it itself. Getting this
+backwards does not merely degrade the audio — it silences it, because an AMBE
+decoder mutes frames whose parameters do not parse.
+
+The default (`auto`) settles it at startup by decoding a known DMR speech frame
+both ways and keeping whichever returns energy. It says so in the log:
+
+```
+vocoder wire probe: raw=10879 interleaved=12 -> raw 49-bit (DVSI AMBE3000)
+```
+
+Pin it by hand (`raw` or `interleaved`) only if the probe cannot decide, which
+it also reports.
+
 ### Log checklist (EchoLink → DMR/YSF)
 
 | Step | Log text | Meaning |
@@ -217,6 +235,7 @@ bridges).
   suggested **0.5** for EchoLink↔YSF, **1.0** for EchoLink↔DMR; range **0**–**4** |
 | `vocoder_host` | yes | AMBE server host (DV3000 / AMBEServer) |
 | `vocoder_port` | yes* | Usually `2460` (*default **2460** if key omitted) |
+| `vocoder_wire` | no | Wire bit order: `auto` (default), `raw`, `interleaved`. See below |
 | `vocoder_log_level` | no | Overrides `[log]` for vocoder channel |
 | `proxy_server` / `proxy_port` / `proxy_password` | no | EchoLink Proxy (port default **8100**, password **PUBLIC**) |
 

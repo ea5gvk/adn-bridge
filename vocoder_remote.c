@@ -30,12 +30,8 @@
 static const uint8_t DV3K_PRODID_REQ[] = { 0x61, 0x00, 0x01, 0x00, 0x30 };
 /* RATET 34 (0x22) = 2450 bps speech, FEC=0 (49-bit frames).
  *
- * md380-emu (and Analog_Bridge soft path for 49-bit) expects the 49 bits in
- * DMR interleaved order on the wire, then deinterleaves before decode.
- * ModeConv / mbelib use deinterleaved (raw) 49-bit — convert at this boundary.
- *
  * Note: Analog_Bridge's useEmulator=true path prefers AMBE72 (RATET 33 /
- * RATEP 3600x2450, 9-byte FEC frames). We stay on 49-bit+interleave49 for now.
+ * RATEP 3600x2450, 9-byte FEC frames). We stay on 49-bit.
  */
 static const uint8_t DV3K_RATET_DMR[] = { 0x61, 0x00, 0x02, 0x00, 0x09, 0x22 };
 
@@ -45,6 +41,19 @@ static const uint8_t INTERLEAVE49_MATRIX[49] = {
     1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 37, 40, 42, 44, 46, 48,
     2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38
 };
+
+/* A genuine DMR speech frame, exactly as ModeConv::dmr33ToAMBE emits it
+ * (standard 49-bit field order). Feeding it to a DVSI AMBE3000 as-is yields
+ * loud audio and its interleaved twin yields silence; md380-emu, which
+ * deinterleaves internally, answers the other way round. That asymmetry is
+ * what VOC_WIRE_AUTO uses to tell the two backends apart — captured off the
+ * air rather than synthesised, because only a real frame has the parameter
+ * structure that makes the wrong ordering decode to nothing. */
+static const uint8_t VOC_PROBE_FRAME[VOC_AMBE_BYTES] =
+    { 0xf8, 0x01, 0xa0, 0x9f, 0x8c, 0x40, 0x80 };
+/* Ratio between the two probe energies below which we refuse to trust the
+ * result. Measured on an AMBE3000R the gap is ~900x, so 4x is very safe. */
+#define VOC_PROBE_MIN_RATIO 4.0
 
 static unsigned g_enc_ok, g_enc_fail, g_dec_ok, g_dec_fail;
 static int g_enc_log_n, g_dec_log_n;
@@ -207,7 +216,10 @@ static int voc_exchange(vocoder_t *v, const uint8_t *req, int reqlen,
     return n;
 }
 
-int vocoder_open(vocoder_t *v, const char *host, int port)
+/* Defined next to the decode path it drives. */
+static void voc_detect_wire(vocoder_t *v, voc_wire_t want);
+
+int vocoder_open(vocoder_t *v, const char *host, int port, voc_wire_t wire)
 {
     struct hostent *he;
     uint8_t rsp[256];
@@ -279,11 +291,14 @@ int vocoder_open(vocoder_t *v, const char *host, int port)
     }
     g_consec_fail = 0;
     v->ready = 1;
-    LOG_VOC_INFO("vocoder ready at %s:%d (RATET 34 / 49-bit FEC=0, wire=interleave49, api=raw)\n",
-             host, port);
     if (prod[0])
         LOG_VOC_INFO("vocoder PRODID: %s\n", prod);
-    LOG_VOC_DEBUG("vocoder: Analog_Bridge soft path often uses AMBE72/RATET33; we use 49-bit+IL49\n");
+    /* Needs v->ready, and must run before any call: it costs ~16 round trips
+     * and leaves the far end's decoder mid-tone. */
+    voc_detect_wire(v, wire);
+    LOG_VOC_INFO("vocoder ready at %s:%d (RATET 34 / 49-bit FEC=0, wire=%s)\n",
+             host, port, v->wire_il ? "interleave49" : "raw");
+    LOG_VOC_DEBUG("vocoder: Analog_Bridge soft path often uses AMBE72/RATET33; we use 49-bit\n");
     return 0;
 }
 
@@ -367,8 +382,10 @@ int vocoder_encode(vocoder_t *v, const int16_t pcm[VOC_PCM_SAMPLES], uint8_t amb
     }
     memcpy(wire, rsp + 6, VOC_AMBE_BYTES);
     memcpy(ambe, wire, VOC_AMBE_BYTES);
-    /* Soft server returns interleaved 49-bit; expose raw to ModeConv. */
-    ambe49_deinterleave(ambe);
+    /* Undo whatever ordering the far end speaks so ModeConv always sees the
+     * standard 49-bit field order. */
+    if (v->wire_il)
+        ambe49_deinterleave(ambe);
     g_enc_ok++;
     if (dbg_periodic(&g_enc_log_n)) {
         hex7(wire_h, sizeof(wire_h), wire);
@@ -379,21 +396,16 @@ int vocoder_encode(vocoder_t *v, const int16_t pcm[VOC_PCM_SAMPLES], uint8_t amb
     return 0;
 }
 
-int vocoder_decode(vocoder_t *v, const uint8_t ambe[VOC_AMBE_BYTES], int16_t pcm[VOC_PCM_SAMPLES])
+/* One decode round trip on an already wire-formatted frame — no bit-order
+ * conversion, so the AUTO probe can drive it directly.
+ * Returns samples written (>0), 0 on timeout, -1 on a malformed response. */
+static int voc_dec_exchange(vocoder_t *v, const uint8_t wire[VOC_AMBE_BYTES],
+                            int16_t pcm[VOC_PCM_SAMPLES])
 {
     uint8_t req[4 + 2 + VOC_AMBE_BYTES];
     uint8_t rsp[4 + 2 + VOC_PCM_SAMPLES * 2 + 8];
-    uint8_t wire[VOC_AMBE_BYTES];
-    char raw_h[20], wire_h[20];
     uint16_t plen;
     int i, n, ns;
-    double rms;
-
-    if (!v->ready)
-        return -1;
-
-    memcpy(wire, ambe, VOC_AMBE_BYTES);
-    ambe49_interleave(wire);
 
     plen = (uint16_t)(2 + VOC_AMBE_BYTES);
     req[0] = DV3K_START;
@@ -405,38 +417,99 @@ int vocoder_decode(vocoder_t *v, const uint8_t ambe[VOC_AMBE_BYTES], int16_t pcm
     memcpy(req + 6, wire, VOC_AMBE_BYTES);
 
     n = voc_exchange(v, req, (int)(4 + plen), rsp, (int)sizeof(rsp));
-    if (n == 0) {
+    if (n == 0)
+        return 0;
+    if (n < 6 || rsp[3] != DV3K_TYPE_AUDIO || rsp[4] != DV3K_AUDIO_FIELD)
+        return -1;
+    /* A short or empty speech field used to pass straight through and be
+     * counted as a successful decode, quietly injecting silence. */
+    ns = rsp[5];
+    if (ns != VOC_PCM_SAMPLES || n < 6 + ns * 2)
+        return -1;
+    for (i = 0; i < ns; i++)
+        pcm[i] = (int16_t)((rsp[6 + i * 2] << 8) | rsp[7 + i * 2]);
+    return ns;
+}
+
+/* Settled output energy for a frame fed repeatedly — AMBE decoders carry
+ * state, so a single frame says little. Negative on I/O failure. */
+static double voc_probe_energy(vocoder_t *v, const uint8_t frame[VOC_AMBE_BYTES])
+{
+    int16_t pcm[VOC_PCM_SAMPLES];
+    int i;
+
+    memset(pcm, 0, sizeof(pcm));
+    for (i = 0; i < 8; i++) {
+        if (voc_dec_exchange(v, frame, pcm) <= 0)
+            return -1.0;
+    }
+    return pcm_rms(pcm, VOC_PCM_SAMPLES);
+}
+
+static void voc_detect_wire(vocoder_t *v, voc_wire_t want)
+{
+    uint8_t il[VOC_AMBE_BYTES];
+    double e_raw, e_il, hi, lo;
+
+    if (want == VOC_WIRE_RAW || want == VOC_WIRE_INTERLEAVED) {
+        v->wire_il = (want == VOC_WIRE_INTERLEAVED);
+        LOG_VOC_INFO("vocoder wire: %s (from config)\n",
+                     v->wire_il ? "interleave49" : "raw 49-bit");
+        return;
+    }
+
+    memcpy(il, VOC_PROBE_FRAME, sizeof(il));
+    ambe49_interleave(il);
+    e_raw = voc_probe_energy(v, VOC_PROBE_FRAME);
+    e_il = voc_probe_energy(v, il);
+
+    if (e_raw < 0.0 || e_il < 0.0) {
+        v->wire_il = 1;
+        LOG_VOC_WARNING("vocoder wire probe failed (no usable response) — "
+                        "assuming interleave49; set vocoder_wire= to override\n");
+        return;
+    }
+    hi = e_raw > e_il ? e_raw : e_il;
+    lo = e_raw > e_il ? e_il : e_raw;
+    if (hi < 1.0 || lo * VOC_PROBE_MIN_RATIO > hi) {
+        v->wire_il = 1;
+        LOG_VOC_WARNING("vocoder wire probe inconclusive (raw=%.0f interleaved=%.0f) — "
+                        "assuming interleave49; set vocoder_wire= to override\n",
+                        e_raw, e_il);
+        return;
+    }
+    v->wire_il = (e_il > e_raw);
+    LOG_VOC_INFO("vocoder wire probe: raw=%.0f interleaved=%.0f -> %s\n",
+                 e_raw, e_il,
+                 v->wire_il ? "interleave49 (md380-emu)" : "raw 49-bit (DVSI AMBE3000)");
+}
+
+int vocoder_decode(vocoder_t *v, const uint8_t ambe[VOC_AMBE_BYTES], int16_t pcm[VOC_PCM_SAMPLES])
+{
+    uint8_t wire[VOC_AMBE_BYTES];
+    char raw_h[20], wire_h[20];
+    int ns;
+    double rms;
+
+    if (!v->ready)
+        return -1;
+
+    memcpy(wire, ambe, VOC_AMBE_BYTES);
+    if (v->wire_il)
+        ambe49_interleave(wire);
+
+    ns = voc_dec_exchange(v, wire, pcm);
+    if (ns <= 0) {
         g_dec_fail++;
         if (dbg_periodic(&g_dec_log_n)) {
             hex7(raw_h, sizeof(raw_h), ambe);
             hex7(wire_h, sizeof(wire_h), wire);
-            LOG_VOC_WARNING("vocoder DEC timeout raw=%s wire=%s ok/fail=%u/%u\n",
-                        raw_h, wire_h, g_dec_ok, g_dec_fail);
+            LOG_VOC_WARNING("vocoder DEC %s raw=%s wire=%s ok/fail=%u/%u\n",
+                        ns == 0 ? "timeout" : "bad rsp", raw_h, wire_h,
+                        g_dec_ok, g_dec_fail);
         }
         return -1;
     }
-    if (n < 6 || rsp[3] != DV3K_TYPE_AUDIO || rsp[4] != DV3K_AUDIO_FIELD) {
-        g_dec_fail++;
-        if (dbg_periodic(&g_dec_log_n)) {
-            hex7(raw_h, sizeof(raw_h), ambe);
-            LOG_VOC_WARNING("vocoder DEC bad rsp n=%d type=0x%02x field=0x%02x raw=%s\n",
-                        n, n >= 4 ? rsp[3] : 0, n >= 5 ? rsp[4] : 0, raw_h);
-        }
-        return -1;
-    }
-    ns = rsp[5];
-    if (ns > VOC_PCM_SAMPLES)
-        ns = VOC_PCM_SAMPLES;
-    if (n < 6 + ns * 2) {
-        g_dec_fail++;
-        return -1;
-    }
-    for (i = 0; i < ns; i++) {
-        int16_t s = (int16_t)((rsp[6 + i * 2] << 8) | rsp[7 + i * 2]);
-        pcm[i] = s;
-    }
-    for (; i < VOC_PCM_SAMPLES; i++)
-        pcm[i] = 0;
     g_dec_ok++;
     rms = pcm_rms(pcm, VOC_PCM_SAMPLES);
     if (dbg_periodic(&g_dec_log_n)) {

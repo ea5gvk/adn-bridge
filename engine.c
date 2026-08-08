@@ -109,7 +109,8 @@ static int engine_start(engine_host_t *host, adn_bridge_config_t *cfg, engine_ct
     if (ctx->plan.needs_vocoder) {
         if (!el_p || !el_p->u.el.vocoder_host[0] || el_p->u.el.vocoder_port <= 0)
             return -1;
-        if (vocoder_open(&core->voc, el_p->u.el.vocoder_host, el_p->u.el.vocoder_port) < 0)
+        if (vocoder_open(&core->voc, el_p->u.el.vocoder_host, el_p->u.el.vocoder_port,
+                         (voc_wire_t)el_p->u.el.vocoder_wire) < 0)
             return -1;
         ctx->vocoder_open = 1;
     }
